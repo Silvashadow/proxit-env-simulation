@@ -1,0 +1,1 @@
+variable "main_settings" {}

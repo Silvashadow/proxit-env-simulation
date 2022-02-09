@@ -1,0 +1,201 @@
+#######
+#VPC
+#######
+
+module "vpc" {
+  source        = "./modules/vpc"
+  main_settings = var.settings
+}
+
+module "secondaryvpc" {
+  source        = "./modules/vpc"
+  main_settings = var.settings
+}
+
+###############
+#Security-Group
+###############
+
+module "SG" {
+  source = "./modules/sg"
+  vpc_id = module.vpc.vpc_output.vpc_id
+}
+
+#####
+# EC2
+#####
+
+# module "ec2" {
+#   source        = "./modules/ec2"
+#   main_settings = var.settings
+#   vpc_details   = module.VPC.vpc_output.public_subnet[0].id
+#   sg_details    = module.SG.sg_output
+#   user_data     = data.template_file.userdata_web.rendered
+# }
+
+############
+#vpc-peering
+############
+# data "aws_caller_identity" "current" {}
+
+# resource "aws_vpc_peering_connection" "primary2secondary" {
+#   peer_owner_id = data.aws_caller_identity.current.account_id
+#   peer_vpc_id   = module.secondaryvpc.vpc_output.vpc_id
+#   vpc_id        = module.vpc.vpc_output.vpc_id
+#   auto_accept   = true
+# }
+
+/**
+ * Route rule.
+ *
+ * Creates a new route rule on the "primary" VPC main route table. All requests
+ * to the "secondary" VPC's IP range will be directed to the VPC peering
+ * connection.
+ */
+# resource "aws_route" "primary2secondary" {
+#   route_table_id            = module.vpc.vpc_output.route_table_id
+#   destination_cidr_block    = var.settings.vpc_cidr
+#   vpc_peering_connection_id = aws_vpc_peering_connection.primary2secondary.id
+# }
+
+/**
+ * Route rule.
+ *
+ * Creates a new route rule on the "secondary" VPC main route table. All
+ * requests to the "secondary" VPC's IP range will be directed to the VPC
+ * peering connection.
+ */
+# resource "aws_route" "secondary2primary" {
+#   route_table_id            = module.secondaryvpc.vpc_output.route_table_id
+#   destination_cidr_block    = var.settings.vpc_cidr
+#   vpc_peering_connection_id = aws_vpc_peering_connection.primary2secondary.id
+# }
+
+###########
+#Local-Vars
+###########
+locals {
+  name   = "replica-postgresql"
+  region = "us-east-1"
+  tags = {
+    Owner       = "user"
+    Environment = "dev"
+  }
+
+  engine                = "postgres"
+  engine_version        = "11.10"
+  family                = "postgres11" # DB parameter group
+  major_engine_version  = "11"         # DB option group
+  instance_class        = "db.t2.micro"
+  allocated_storage     = 20
+  max_allocated_storage = 100
+  port                  = 5432
+}
+
+data "aws_secretsmanager_secret" "by-name" {
+  name = "my-postgres-cred"
+}
+
+################################################################################
+# Master DB
+################################################################################
+
+module "master" {
+  source = "terraform-aws-modules/rds/aws"
+
+  identifier = "${local.name}-master"
+
+  engine               = local.engine
+  engine_version       = local.engine_version
+  family               = local.family
+  major_engine_version = local.major_engine_version
+  instance_class       = local.instance_class
+
+  allocated_storage     = local.allocated_storage
+  max_allocated_storage = local.max_allocated_storage
+  storage_encrypted     = false
+
+  # jsondecode(data.aws_secretsmanager_secret_version.current.secret_string)["DATABASE_URL"]
+  name     = "replicaPostgresql"
+  username = "replica_postgresql"
+  password = "testrds123"
+  port     = local.port
+
+  multi_az               = true
+  create_db_subnet_group = false
+  db_subnet_group_name   = aws_db_subnet_group.rds_subnet.id
+  vpc_security_group_ids = [module.SG.sg_output.ec2_sg_id]
+
+  maintenance_window              = "Mon:00:00-Mon:03:00"
+  backup_window                   = "03:00-06:00"
+  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
+
+  # Backups are required in order to create a replica
+  backup_retention_period = 1
+  skip_final_snapshot     = true
+  deletion_protection     = false
+
+  tags = local.tags
+}
+
+resource "aws_db_subnet_group" "rds_subnet" {
+  name       = "rds_subnet"
+  subnet_ids = module.vpc.vpc_output.private_subnet
+
+  tags = {
+    Name = "rds-subnet-group"
+  }
+}
+
+################################################################################
+# Replica DB
+################################################################################
+
+module "replica" {
+  source = "terraform-aws-modules/rds/aws"
+
+  identifier = "${local.name}-replica"
+
+  # Source database. For cross-region use db_instance_arn
+  replicate_source_db = module.master.db_instance_id
+
+  engine               = local.engine
+  engine_version       = local.engine_version
+  family               = local.family
+  major_engine_version = local.major_engine_version
+  instance_class       = local.instance_class
+
+  allocated_storage     = local.allocated_storage
+  max_allocated_storage = local.max_allocated_storage
+  storage_encrypted     = false
+
+  # Username and password should not be set for replicas
+  username = null
+  password = null
+  port     = local.port
+
+  multi_az               = false
+  vpc_security_group_ids = [module.SG.sg_output.ec2_sg_id]
+
+  maintenance_window              = "Tue:00:00-Tue:03:00"
+  backup_window                   = "03:00-06:00"
+  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
+
+  backup_retention_period = 0
+  skip_final_snapshot     = true
+  deletion_protection     = false
+
+  # Not allowed to specify a subnet group for replicas in the same region
+  create_db_subnet_group = false
+
+  tags = local.tags
+}
+
+####
+# S3
+####
+
+module "s3" {
+  source        = "./modules/s3"
+  main_settings = var.settings
+}
